@@ -1,12 +1,12 @@
 # eve/extensions/code
 
-`eve/extensions/code` is an eve extension for coding work. It contributes `apply_patch`, `grep`, investigation and review skills, a read-only worker subagent, sandbox tooling, and shared PR-watch primitives. Vercel credentials are brokered before each turn. GitHub instructions, the `pr` skill, and the authenticated `gh` tool live in [`eve/extensions/git`](../eve-git/README.md). Because eve workflow directives are application-only, consumers own their `prwatch` / `prwatch_delete` workflow tools.
+`eve/extensions/code` is an eve extension for coding work. It contributes `apply_patch`, investigation and review skills, a read-only worker subagent, sandbox tooling, and shared PR-watch primitives. Vercel credentials are brokered before each turn. GitHub instructions, the `pr` skill, and the authenticated `gh` tool live in [`eve/extensions/git`](../eve-git/README.md). Because eve workflow directives are application-only, consumers own their `prwatch` / `prwatch_delete` workflow tools.
 
 It ships inside the `eve` package. This private `@eve/code` workspace package is its source of truth: eve's build copies `extension/` into `packages/eve/src/extensions/code/extension` and publishes it with these entry points:
 
 - `eve/extensions/code`: the extension
 - `eve/extensions/code/sandbox`: sandbox bootstrap and credential helpers
-- `eve/extensions/code/tools`: `apply_patch` and `grep`
+- `eve/extensions/code/tools`: `apply_patch` and `grep`; the extension mounts only `apply_patch`
 
 ## Mount
 

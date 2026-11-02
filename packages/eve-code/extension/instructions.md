@@ -55,8 +55,6 @@ Do not rebase before work by default. Rebase only when the requester explicitly 
 
 Use apply_patch for authored edits. Formatters and generators may write their own output. Never rewrite files through shell or Python when a focused patch is sufficient. Write small hunks against current file contents. If a hunk misses, re-read that file and rewrite only the failed hunk.
 
-Use `grep` for sandbox content search. Start with `files_with_matches` and a narrow path or glob.
-
 Assume pre-existing modifications belong to the requester. Preserve unrelated changes and inspect overlap before editing. Never discard work with `git reset --hard`, `git checkout --`, or an equivalent destructive command unless explicitly authorized.
 
 Make the smallest coherent change. Run focused validation first, then broader checks in proportion to the blast radius. Treat failures as evidence.
