@@ -1,7 +1,14 @@
 import type { SessionAuthContext } from "#channel/types.js";
 
 import { resolvedPromptLabel } from "#channel/resolved-prompt.js";
-import type { Interaction, RequestSettlement } from "#channel/interaction-prompts.js";
+import {
+  interaction,
+  type Interaction,
+  type RequestSettlement,
+} from "#channel/interaction-prompts.js";
+import { sessionTables } from "#protocol/session-projection/session-view.js";
+import type { ChannelEventContext, ChannelEventOf } from "#public/definitions/channel.js";
+import { parseJsonObject } from "#shared/json.js";
 import { postedIn, type SignInSurface } from "#channel/sign-in.js";
 import { surfaceEvents } from "#channel/surface.js";
 import { createLogger } from "#internal/logging.js";
@@ -176,13 +183,41 @@ function discordSignIns(channel: DiscordEventChannel): SignInSurface {
 }
 
 /** Built-in Discord event handlers for typing, replies, HITL, and terminal errors. */
-export const defaultEvents: DiscordChannelEvents = surfaceEvents<DiscordEventChannel>({
-  typing: (channel) => channel.discord.startTyping(),
-  post: (channel, text) => channel.discord.post(text),
-  restart: "command",
-  requests: { show: postDiscordRequest, settle: editDiscordSettledRequest },
-  signIns: discordSignIns,
-});
+export const defaultEvents = {
+  ...surfaceEvents<DiscordEventChannel>({
+    typing: (channel) => channel.discord.startTyping(),
+    post: (channel, text) => channel.discord.post(text),
+    restart: "command",
+    requests: { show: postDiscordRequest, settle: editDiscordSettledRequest },
+    signIns: discordSignIns,
+  }),
+  async "response.settled"(
+    { data }: ChannelEventOf<"response.settled">,
+    { channel, view }: ChannelEventContext<DiscordEventChannel>,
+  ): Promise<void> {
+    if (data.outcome !== "refused" && data.outcome !== "failed") return;
+    const tables = sessionTables(view);
+    const response = tables.responses[data.responseId];
+    if (response === undefined) return;
+    const request = interaction(tables, response.interactionId);
+    const prompt = channel.state.hitlPrompts?.[response.interactionId];
+    if (request?.status !== "open" || prompt === undefined) return;
+    const components = renderInteractionComponents(request);
+    const body = parseJsonObject({ allowed_mentions: DISCORD_NO_MENTIONS, components });
+    const channelId = encodeURIComponent(channel.discord.channelId);
+    const messageId = encodeURIComponent(prompt.messageId);
+    const edited = await channel.discord.request(
+      `/channels/${channelId}/messages/${messageId}`,
+      body,
+      {
+        botAuth: true,
+        method: "PATCH",
+      },
+    );
+    if (edited.ok === false)
+      throw new Error(`Discord message edit failed with HTTP ${edited.status}.`);
+  },
+};
 
 async function postDiscordRequest(
   channel: DiscordEventChannel,
@@ -218,5 +253,6 @@ async function editDiscordSettledRequest(
     await editDiscordResolvedPrompt(channel.discord, prompt, label);
   } catch (error) {
     log.warn("Discord answered prompt edit failed", { error, requestId: settlement.interactionId });
+    await channel.discord.post("This request has ended, but its message could not be updated.");
   }
 }

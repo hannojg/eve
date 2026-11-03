@@ -25,6 +25,7 @@ interface DiscordComponent {
   readonly label?: string;
   readonly options?: readonly { readonly label: string; readonly value: string }[];
   readonly type?: number;
+  readonly disabled?: boolean;
 }
 
 interface PressHandle {
@@ -88,6 +89,8 @@ export function discordDriver(
   const originals = new Map<string, string>();
   /** Interaction tokens answered with an ephemeral deferred response, which only the presser sees. */
   const ephemeralTokens = new Set<string>();
+  /** The platform keeps omitted fields when a callback or PATCH edits a message. */
+  const messages = new Map<string, Record<string, unknown>>();
   /** The thread the bot started for the conversation, once it has. */
   let threadId: string | undefined;
   /** The bot's latest channel message, which a person in a server replies to so the bot hears them. */
@@ -136,15 +139,28 @@ export function discordDriver(
       return { body, method, response: { id: threadId, type: 11 } };
     }
     if (path.includes("/thread-members/")) return { body, method, response: {} };
+    const callback = /\/interactions\/[^/]+\/([^/]+)\/callback$/u.exec(path);
+    if (callback !== null && body.type === 7) {
+      const id = originals.get(callback[1]!);
+      if (id === undefined) throw new Error("Component callback has no original message.");
+      const previous = messages.get(id);
+      const response = { ...previous, ...body.data, channel_id: conversationChannel(), id };
+      messages.set(id, response);
+      return { body, method, response };
+    }
     const id = writtenMessageId(request.method, path);
     if (request.method === "POST" && /\/channels\/[^/]+\/messages$/u.test(path)) {
       lastBotMessage = id;
     }
-    return {
-      body,
-      method,
-      response: { channel_id: /\/channels\/([^/]+)\//u.exec(path)?.[1] ?? channelId, id },
+    const previous = messages.get(id);
+    const response = {
+      ...previous,
+      ...body,
+      channel_id: /\/channels\/([^/]+)\//u.exec(path)?.[1] ?? channelId,
+      id,
     };
+    messages.set(id, response);
+    return { body, method, response };
   }
 
   /** `person`'s message as the relay forwards it: the Gateway dispatch, unchanged. */
@@ -292,7 +308,7 @@ export function discordDriver(
     },
     findOptions(call, prompt) {
       if (!isMessageWrite(call)) return undefined;
-      const body = call.body as {
+      const body = call.response as {
         readonly components?: readonly { readonly components?: readonly DiscordComponent[] }[];
         readonly content?: string;
       };
@@ -304,12 +320,12 @@ export function discordDriver(
       const token = /\/webhooks\/[^/]+\/([^/]+)\/messages\/@original$/u.exec(call.method)?.[1];
       return {
         id: (call.response as { readonly id: string }).id,
-        links: linkTargets((call.body as { readonly components?: unknown }).components),
+        links: linkTargets((call.response as { readonly components?: unknown }).components),
         onlyPerson:
           (token !== undefined && ephemeralTokens.has(token)) ||
-          (((call.body as { readonly flags?: number }).flags ?? 0) & EPHEMERAL_FLAG) !== 0,
+          (((call.response as { readonly flags?: number }).flags ?? 0) & EPHEMERAL_FLAG) !== 0,
         options: choicesOf(call),
-        text: (call.body as { readonly content?: string }).content ?? "",
+        text: (call.response as { readonly content?: string }).content ?? "",
       };
     },
     shownReply(body) {
@@ -352,7 +368,11 @@ export function discordDriver(
               : { component_type: 3, custom_id: handle.customId, values: [handle.value] },
           id,
           ...where(PEOPLE[person]),
-          message: { content: handle.content, id: handle.messageId },
+          message: {
+            ...messages.get(handle.messageId),
+            content: handle.content,
+            id: handle.messageId,
+          },
           token: `tok-${id}`,
           type: 3,
           version: 1,
@@ -361,13 +381,13 @@ export function discordDriver(
     },
     postedText(call) {
       if (!isMessageWrite(call)) return undefined;
-      return (call.body as { readonly content?: string }).content;
+      return (call.response as { readonly content?: string }).content;
     },
   };
 }
 
 function choicesOf(call: PlatformCall): RenderedOption[] {
-  const body = call.body as {
+  const body = call.response as {
     readonly components?: readonly { readonly components?: readonly DiscordComponent[] }[];
     readonly content?: string;
   };
@@ -384,7 +404,7 @@ function visibleChoices(
   messageId: string,
   content: string | undefined,
 ): RenderedOption[] {
-  if (component.custom_id === undefined) return [];
+  if (component.custom_id === undefined || component.disabled === true) return [];
   const customId = component.custom_id;
   if (component.type === 2 && component.label !== undefined) {
     return [
@@ -406,6 +426,8 @@ function visibleChoices(
  * channel message when the interaction token fails.
  */
 function isMessageWrite(call: PlatformCall): boolean {
+  if (call.method.endsWith("/callback"))
+    return (call.body as { readonly type?: number }).type === 7;
   return (
     /^(PATCH|POST) /u.test(call.method) &&
     !call.method.endsWith("/typing") &&

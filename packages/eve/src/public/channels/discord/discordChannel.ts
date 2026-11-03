@@ -15,6 +15,7 @@ import type { ChannelContinuationOps } from "#public/definitions/channel.js";
 import { createLogger, logError } from "#internal/logging.js";
 import {
   callDiscordApi,
+  DISCORD_NO_MENTIONS,
   createDiscordFollowupMessage,
   discordContinuationToken,
   editDiscordOriginalResponse,
@@ -67,7 +68,7 @@ import {
   type DiscordGatewayConfig,
 } from "#public/channels/discord/messages.js";
 import { verifyDiscordInbound } from "#public/channels/discord/verifyInbound.js";
-import { readNonEmptyString } from "#shared/guards.js";
+import { isObject, readNonEmptyString } from "#shared/guards.js";
 import { parseJsonObject, type JsonObject } from "#shared/json.js";
 import { defineChannel, POST, type Channel } from "#public/definitions/channel.js";
 import {
@@ -700,13 +701,13 @@ async function answerRevealedAuthorization(input: {
   }
 }
 
-function handleComponentInteraction(input: {
+async function handleComponentInteraction(input: {
   readonly config: DiscordChannelConfig;
   readonly interaction: DiscordComponentInteraction;
   readonly onAnswers: NonNullable<DiscordChannelConfig["onAnswers"]>;
   readonly from: ChannelFrom<DiscordChannelState>;
   readonly waitUntil: (task: Promise<unknown>) => void;
-}): Response {
+}): Promise<Response> {
   if (isDiscordFreeformComponent(input.interaction.customId)) {
     const prompt = readMessageContent(input.interaction.raw);
     return discordJsonBody(
@@ -719,16 +720,68 @@ function handleComponentInteraction(input: {
 
   const answers = deriveComponentAnswers(input.interaction);
   if (answers.length > 0) {
+    const state = stateFromInteraction(input.interaction, {
+      conversationId: input.interaction.messageId,
+      hasMessageAnchor: true,
+      initialResponseSent: true,
+    });
+    const discord = buildDiscordHandle({ config: input.config, state });
+    let result: DiscordAnswerResult;
+    try {
+      const defaultAuth = defaultDiscordAuth(input.interaction);
+      result = await input.onAnswers({ defaultAuth, discord }, input.interaction);
+    } catch (error) {
+      log.error("input response handler failed", { error });
+      return discordJson({
+        content: "Your answer could not be accepted. Please try again.",
+        ephemeral: true,
+      });
+    }
+    if (result === null) {
+      return discordJson({ content: "This answer was not accepted.", ephemeral: true });
+    }
+    const label = answers[0]?.optionId === "approve" ? "Approving…" : "Submitting…";
+    const { id, token, customId } = input.interaction;
+    const interactionId = encodeURIComponent(id);
+    const interactionToken = encodeURIComponent(token);
+    try {
+      // Commit the busy message before dispatch, so a fast settlement cannot be overwritten.
+      const acknowledgement = await callDiscordApi({
+        apiBaseUrl: input.config.api?.apiBaseUrl,
+        fetch: input.config.api?.fetch,
+        path: `/interactions/${interactionId}/${interactionToken}/callback`,
+        body: {
+          type: DISCORD_INTERACTION_RESPONSE_TYPE.UPDATE_MESSAGE,
+          data: {
+            allowed_mentions: DISCORD_NO_MENTIONS,
+            components: [
+              {
+                type: 1,
+                components: [{ type: 2, custom_id: customId, disabled: true, label, style: 2 }],
+              },
+            ],
+          },
+        },
+      });
+      if (acknowledgement.ok === false) {
+        log.error("Discord answer acknowledgement failed", { status: acknowledgement.status });
+        return new Response(null, { status: 502 });
+      }
+    } catch (error) {
+      log.error("Discord answer acknowledgement failed", { error });
+      return new Response(null, { status: 502 });
+    }
     input.waitUntil(
       dispatchAnswers({
         config: input.config,
-        onAnswers: input.onAnswers,
+        onAnswers: () => result,
         conversationId: input.interaction.messageId,
         answers,
         interaction: input.interaction,
         from: input.from,
       }),
     );
+    return new Response(null, { status: 202 });
   }
   return discordJsonBody({ type: DISCORD_INTERACTION_RESPONSE_TYPE.DEFERRED_UPDATE_MESSAGE });
 }
@@ -834,7 +887,28 @@ async function dispatchAnswers(input: {
     }),
   );
   const response = await respondOrRetireInactivePrompt(
-    () => source.respond(input.answers, { auth }),
+    async () => {
+      const delivery = await source.respond(input.answers, { auth });
+      if (input.interaction.type !== DISCORD_INTERACTION_TYPE.MESSAGE_COMPONENT) return;
+      let responseId: string | undefined;
+      let refused = false;
+      for await (const event of delivery.stream()) {
+        if (event.type === "response.submitted" && event.data.deliveryId === delivery.deliveryId) {
+          responseId = event.data.responseId;
+        }
+        if (event.type === "response.settled" && event.data.responseId === responseId) {
+          refused = event.data.outcome === "refused" || event.data.outcome === "failed";
+        }
+        if (
+          event.type === "delivery.settled" &&
+          event.data.deliveryId === delivery.deliveryId &&
+          event.data.outcome === "ignored"
+        ) {
+          await discord.editOriginalResponse({ components: [] });
+        }
+      }
+      if (refused) await sendAnswerFailureNotice(discord);
+    },
     {
       // The session's record of the prompt is gone, so its text comes from the
       // pressed message. A modal submitted outside a message has neither, and
@@ -842,14 +916,49 @@ async function dispatchAnswers(input: {
       retirePrompt: async (label) => {
         const messageId = input.interaction.messageId;
         const content = readMessageContent(input.interaction.raw);
-        if (messageId === undefined || content === undefined) return;
+        if (messageId === undefined) return;
+        if (content === undefined) {
+          await discord.editOriginalResponse({ components: [] });
+          return;
+        }
         await editDiscordResolvedPrompt(discord, { content, messageId }, label);
       },
     },
     log,
   );
+  if (response.outcome === "failed") {
+    await restoreDiscordAnswer(discord, input.interaction);
+    await sendAnswerFailureNotice(discord);
+    return;
+  }
   if (response.outcome !== "inactive") return;
   await Promise.all([response.retirement, sendInactiveNotice(discord)]);
+}
+
+async function restoreDiscordAnswer(
+  discord: DiscordHandle,
+  interaction: DiscordAnswerInteraction,
+): Promise<void> {
+  if (interaction.type !== DISCORD_INTERACTION_TYPE.MESSAGE_COMPONENT) return;
+  const message = isObject(interaction.raw.message) ? interaction.raw.message : undefined;
+  const components = message?.components ?? [];
+  const body = parseJsonObject({ allowed_mentions: DISCORD_NO_MENTIONS, components });
+  try {
+    await discord.editOriginalResponse(body);
+  } catch (error) {
+    log.error("Discord answer controls restore failed", { error });
+  }
+}
+
+async function sendAnswerFailureNotice(discord: DiscordHandle): Promise<void> {
+  try {
+    await discord.followup({
+      content: "Your answer could not be accepted. Please try again.",
+      flags: DISCORD_EPHEMERAL_MESSAGE_FLAG,
+    });
+  } catch (error) {
+    log.error("Discord answer failure notice failed", { error });
+  }
 }
 
 /** Tells only the presser that the prompt they answered is no longer active. */

@@ -32,6 +32,13 @@ const customId = (
   })[0] as { components: Array<{ custom_id: string }> }
 ).components[0]!.custom_id;
 
+const components = [
+  {
+    type: 1,
+    components: [{ type: 2, custom_id: customId, label: "Approve", style: 1 }],
+  },
+];
+
 /** A press of Approve in guild G01, as Discord sends it: the presser on `member`. */
 function press(content: string | null = "Approve?"): Request {
   const body = JSON.stringify({
@@ -41,7 +48,7 @@ function press(content: string | null = "Approve?"): Request {
     guild_id: "G01",
     id: "I-U01",
     member: { user: { id: "U01", username: "U01" } },
-    message: { content, id: "M01" },
+    message: { components, content, id: "M01" },
     token: "tok2",
     type: 3,
     version: 1,
@@ -60,17 +67,17 @@ function press(content: string | null = "Approve?"): Request {
   });
 }
 
-/** Posts `request` to the channel's webhook and drains every task it hands to `waitUntil`. */
+/** Posts `request` and exposes the response separately from its background work. */
 async function firePost(
   channel: unknown,
   request: Request,
   send: Mock<(...args: any[]) => any>,
-): Promise<void> {
+): Promise<{ response: Response; finished: Promise<unknown> }> {
   if (!isCompiledChannel(channel)) throw new Error("Expected a compiled channel.");
   const post = channel.routes.find((route) => route.method === "POST");
   if (!post || !isHttpRouteDefinition(post)) throw new Error("Expected a POST route.");
   const waitUntil = vi.fn();
-  await post.handler(request, {
+  const response = await post.handler(request, {
     ...mockAgentRouteArgs(),
     attachSession: vi.fn() as never,
     ...mockChannelContext(send),
@@ -79,12 +86,8 @@ async function firePost(
     requestIp: null,
     waitUntil,
   });
-  let drained = 0;
-  while (drained < waitUntil.mock.calls.length) {
-    const pending = waitUntil.mock.calls.slice(drained).map(([task]) => task as Promise<unknown>);
-    drained = waitUntil.mock.calls.length;
-    await Promise.allSettled(pending);
-  }
+  const pending = waitUntil.mock.calls.map(([task]) => task as Promise<unknown>);
+  return { response, finished: Promise.all(pending) };
 }
 
 describe("discordChannel press no session takes", () => {
@@ -121,40 +124,250 @@ describe("discordChannel press no session takes", () => {
     method: "POST",
     url: "https://discord.com/api/v10/webhooks/APP1/tok2",
   };
+  const busy = {
+    body: {
+      type: 7,
+      data: {
+        allowed_mentions: { parse: [] },
+        components: [
+          {
+            type: 1,
+            components: [
+              { type: 2, custom_id: customId, disabled: true, label: "Approving…", style: 2 },
+            ],
+          },
+        ],
+      },
+    },
+    method: "POST",
+    url: "https://discord.com/api/v10/interactions/I-U01/tok2/callback",
+  };
+  const restored = {
+    body: { allowed_mentions: { parse: [] }, components },
+    method: "PATCH",
+    url: "https://discord.com/api/v10/webhooks/APP1/tok2/messages/@original",
+  };
+
+  it("waits for authorization before changing shared controls", async () => {
+    const answer = Promise.withResolvers<null>();
+    const onAnswers = vi.fn(() => answer.promise);
+    const { channel, calls } = discordApi({ onAnswers });
+    const send = vi.fn();
+    const request = press();
+
+    const posting = firePost(channel, request, send);
+    await vi.waitFor(() => {
+      expect(onAnswers).toHaveBeenCalledOnce();
+    });
+    const pendingCalls = calls();
+    expect(pendingCalls).toEqual([]);
+    expect(send).not.toHaveBeenCalled();
+
+    answer.resolve(null);
+    const posted = await posting;
+    await posted.finished;
+    const finishedCalls = calls();
+    expect(finishedCalls).toEqual([]);
+  });
+
+  it("does not dispatch an answer before Discord commits the busy update", async () => {
+    const acknowledgement = Promise.withResolvers<Response>();
+    const fetchMock = vi.fn(() => acknowledgement.promise);
+    const { channel } = discordApi({ api: { fetch: fetchMock as typeof fetch } });
+    const send = vi.fn();
+    const delivery = {
+      deliveryId: "D01",
+      async *stream() {
+        yield { type: "delivery.settled", data: { deliveryId: "D01", outcome: "applied" } };
+      },
+    };
+    send.mockResolvedValue(delivery);
+    const request = press();
+
+    const posting = firePost(channel, request, send);
+    await vi.waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledOnce();
+    });
+    expect(send).not.toHaveBeenCalled();
+
+    const response = new Response(null, { status: 204 });
+    acknowledgement.resolve(response);
+    const posted = await posting;
+    await posted.finished;
+    expect(send).toHaveBeenCalledOnce();
+  });
 
   it("retires the pressed prompt and tells only the presser", async () => {
     captureLogRecords();
     const { channel, calls } = discordApi();
+    const request = press();
+    const send = notActive();
 
-    await firePost(channel, press(), notActive());
+    const posted = await firePost(channel, request, send);
+    await posted.finished;
 
-    expect(calls()).toEqual([prompt, notice]);
+    const requests = calls();
+    expect(requests).toEqual([busy, prompt, notice]);
   });
 
-  it("only tells the presser when the press carries no prompt to keep", async () => {
+  it("clears the busy controls when the press carries no prompt to keep", async () => {
     captureLogRecords();
     const { channel, calls } = discordApi();
+    const request = press(null);
+    const send = notActive();
 
-    await firePost(channel, press(null), notActive());
+    const posted = await firePost(channel, request, send);
+    await posted.finished;
 
-    expect(calls()).toEqual([notice]);
+    const requests = calls();
+    expect(requests).toEqual([
+      busy,
+      { ...restored, body: { allowed_mentions: { parse: [] }, components: [] } },
+      notice,
+    ]);
   });
 
-  it("leaves the prompt alone when delivery fails for another reason", async () => {
+  it("restores the controls and reports a delivery failure privately", async () => {
     captureLogRecords();
     const { channel, calls } = discordApi();
+    const request = press();
+    const send = vi.fn();
+    const error = new Error("boom");
+    send.mockRejectedValue(error);
 
-    await firePost(channel, press(), vi.fn().mockRejectedValue(new Error("boom")));
+    const posted = await firePost(channel, request, send);
+    await posted.finished;
 
-    expect(calls()).toEqual([]);
+    const requests = calls();
+    expect(requests).toEqual([
+      busy,
+      restored,
+      {
+        ...notice,
+        body: {
+          allowed_mentions: { parse: [] },
+          content: "Your answer could not be accepted. Please try again.",
+          flags: 64,
+        },
+      },
+    ]);
   });
 
   it("leaves the prompt alone when onAnswers drops the press", async () => {
-    captureLogRecords();
     const { channel, calls } = discordApi({ onAnswers: () => null });
+    const request = press();
+    const send = vi.fn();
 
-    await firePost(channel, press(), notActive());
+    const posted = await firePost(channel, request, send);
+    await posted.finished;
 
-    expect(calls()).toEqual([]);
+    const requests = calls();
+    expect(requests).toEqual([]);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("reports an authorization failure without changing the shared controls", async () => {
+    captureLogRecords();
+    const { channel, calls } = discordApi({
+      onAnswers: () => {
+        throw new Error("boom");
+      },
+    });
+    const request = press();
+    const send = vi.fn();
+
+    const posted = await firePost(channel, request, send);
+    await posted.finished;
+    const acknowledgement = await posted.response.json();
+    const requests = calls();
+
+    expect(requests).toEqual([]);
+    expect(acknowledgement).toMatchObject({ data: { flags: 64 }, type: 4 });
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("keeps the busy controls after admission while the request settles", async () => {
+    const settled = Promise.withResolvers<void>();
+    const delivery = {
+      deliveryId: "D01",
+      async *stream() {
+        await settled.promise;
+        yield { type: "delivery.settled", data: { deliveryId: "D01", outcome: "applied" } };
+      },
+    };
+    const { channel, calls } = discordApi();
+    const send = vi.fn();
+    send.mockResolvedValue(delivery);
+    const request = press();
+
+    const posted = await firePost(channel, request, send);
+    const pendingCalls = calls();
+    expect(pendingCalls).toEqual([busy]);
+    expect(posted.response.status).toBe(202);
+
+    settled.resolve();
+    await posted.finished;
+    const finishedCalls = calls();
+    expect(finishedCalls).toEqual([busy]);
+  });
+
+  it("does not deliver an answer if the busy update fails", async () => {
+    captureLogRecords();
+    const failure = new Response(null, { status: 500 });
+    const fetchMock = vi.fn(async () => failure);
+    const { channel } = discordApi({ api: { fetch: fetchMock as typeof fetch } });
+    const request = press();
+    const send = vi.fn();
+
+    const posted = await firePost(channel, request, send);
+    await posted.finished;
+
+    expect(posted.response.status).toBe(502);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  for (const outcome of ["refused", "failed"]) {
+    it(`privately reports a ${outcome} response to its responder`, async () => {
+      const delivery = {
+        deliveryId: "D01",
+        async *stream() {
+          yield { type: "response.submitted", data: { deliveryId: "D01", responseId: "R01" } };
+          yield { type: "response.settled", data: { responseId: "R01", outcome } };
+        },
+      };
+      const { channel, calls } = discordApi();
+      const send = vi.fn();
+      send.mockResolvedValue(delivery);
+      const request = press();
+
+      const posted = await firePost(channel, request, send);
+      await posted.finished;
+
+      const requests = calls();
+      expect(requests).toHaveLength(2);
+      expect(requests[1]).toMatchObject({ body: { flags: 64 } });
+    });
+  }
+
+  it("clears the busy controls when an already settled request ignores the answer", async () => {
+    const delivery = {
+      deliveryId: "D01",
+      async *stream() {
+        yield { type: "delivery.settled", data: { deliveryId: "D01", outcome: "ignored" } };
+      },
+    };
+    const { channel, calls } = discordApi();
+    const send = vi.fn();
+    send.mockResolvedValue(delivery);
+    const request = press();
+
+    const posted = await firePost(channel, request, send);
+    await posted.finished;
+
+    const requests = calls();
+    expect(requests).toEqual([
+      busy,
+      { ...restored, body: { allowed_mentions: { parse: [] }, components: [] } },
+    ]);
   });
 });

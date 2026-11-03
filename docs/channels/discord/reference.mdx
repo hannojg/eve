@@ -104,6 +104,8 @@ Approvals and questions render as Discord components. Confirmations and options 
 
 A press, select, or modal submission answers as the Discord user who made it, with the same `defaultDiscordAuth` identity their commands get. Approvals are requester-only by default, so only the person whose command asked can approve.
 
+After `onAnswers` accepts an approval press or option submission, eve replaces the controls with a disabled **Approving…** or **Submitting…** button until the request settles. eve confirms this update with Discord before it delivers the answer, so the busy state cannot overwrite the final message. If the response policy refuses the answer while the request remains open, eve restores the controls. A delivery failure also shows a private error to the person who answered. If the final message edit fails, eve posts a notice that the request has ended.
+
 `onAnswers(ctx, interaction)` decides who an answer comes from. Return `{ auth }` to accept the answer, or `null` (or throw) to drop it and keep the request open. `ctx.defaultAuth` is the presser's `defaultDiscordAuth`. It identifies the presser but doesn't authorize them.
 
 If you customize `onCommand`, eve drops every press and submission, with a warning, until you also set `onAnswers`. Otherwise requester-only approvals would refuse the requester, and people your `onCommand` turns away could answer. Give both hooks the same mapping and checks:
