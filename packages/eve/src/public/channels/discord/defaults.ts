@@ -8,7 +8,8 @@ import {
 } from "#channel/interaction-prompts.js";
 import { sessionTables } from "#protocol/session-projection/session-view.js";
 import type { ChannelEventContext, ChannelEventOf } from "#public/definitions/channel.js";
-import { parseJsonObject } from "#shared/json.js";
+import { parseJsonObject, type JsonObject } from "#shared/json.js";
+import { isObject, readNonEmptyString } from "#shared/guards.js";
 import { postedIn, type SignInSurface } from "#channel/sign-in.js";
 import { surfaceEvents } from "#channel/surface.js";
 import { createLogger } from "#internal/logging.js";
@@ -17,6 +18,7 @@ import {
   DISCORD_NO_MENTIONS,
   splitDiscordMessageContent,
 } from "#public/channels/discord/api.js";
+import { DISCORD_EPHEMERAL_MESSAGE_FLAG } from "#public/channels/discord/inbound.js";
 import type {
   DiscordCommandInteraction,
   DiscordInteractionBase,
@@ -108,11 +110,44 @@ export function defaultOnCommand(
  */
 export async function editDiscordResolvedPrompt(
   discord: Pick<DiscordHandle, "channelId" | "request">,
-  prompt: Pick<DiscordHitlPrompt, "content" | "messageId">,
+  prompt: Pick<DiscordHitlPrompt, "content" | "messageId" | "ephemeralWebhookId">,
   label: string,
+  interactionToken?: string,
 ): Promise<void> {
   const content = `${prompt.content}\n\n${label}`.slice(0, DISCORD_MESSAGE_CONTENT_MAX_LENGTH);
-  await editDiscordMessage(discord, prompt.messageId, content);
+  await editDiscordPromptMessage(
+    discord,
+    prompt,
+    { allowed_mentions: DISCORD_NO_MENTIONS, components: [], content },
+    interactionToken,
+  );
+}
+
+/** Public prompts use bot auth so their controls can be retired after interaction tokens expire. */
+export async function editDiscordPromptMessage(
+  discord: Pick<DiscordHandle, "channelId" | "request">,
+  prompt: Pick<DiscordHitlPrompt, "messageId" | "ephemeralWebhookId">,
+  body: JsonObject,
+  interactionToken?: string,
+): Promise<void> {
+  const messageId = encodeURIComponent(prompt.messageId);
+  let path: string;
+  if (prompt.ephemeralWebhookId === undefined) {
+    const channelId = encodeURIComponent(discord.channelId);
+    path = `/channels/${channelId}/messages/${messageId}`;
+  } else {
+    if (interactionToken === undefined)
+      throw new Error("Discord prompt edit requires an interaction token.");
+    const ephemeralWebhookId = encodeURIComponent(prompt.ephemeralWebhookId);
+    const token = encodeURIComponent(interactionToken);
+    path = `/webhooks/${ephemeralWebhookId}/${token}/messages/${messageId}`;
+  }
+  const response = await discord.request(path, body, {
+    botAuth: prompt.ephemeralWebhookId === undefined,
+    method: "PATCH",
+  });
+  if (response.ok === false)
+    throw new Error(`Discord message edit failed with HTTP ${response.status}.`);
 }
 
 /**
@@ -204,18 +239,12 @@ export const defaultEvents = {
     if (request?.status !== "open" || prompt === undefined) return;
     const components = renderInteractionComponents(request);
     const body = parseJsonObject({ allowed_mentions: DISCORD_NO_MENTIONS, components });
-    const channelId = encodeURIComponent(channel.discord.channelId);
-    const messageId = encodeURIComponent(prompt.messageId);
-    const edited = await channel.discord.request(
-      `/channels/${channelId}/messages/${messageId}`,
+    await editDiscordPromptMessage(
+      channel.discord,
+      prompt,
       body,
-      {
-        botAuth: true,
-        method: "PATCH",
-      },
+      channel.state.promptInteractionToken,
     );
-    if (edited.ok === false)
-      throw new Error(`Discord message edit failed with HTTP ${edited.status}.`);
   },
 };
 
@@ -227,11 +256,18 @@ async function postDiscordRequest(
   const components = renderInteractionComponents(request);
   const posted = await channel.discord.post({ components, content });
   if (components.length === 0 || !posted.id) return;
+  const message = isObject(posted.raw) ? posted.raw : undefined;
+  const flags = typeof message?.flags === "number" ? message.flags : 0;
+  const ephemeral = (flags & DISCORD_EPHEMERAL_MESSAGE_FLAG) !== 0;
+  const ephemeralWebhookId = ephemeral ? readNonEmptyString(message?.webhook_id) : undefined;
+  if (ephemeralWebhookId !== undefined)
+    channel.state.promptInteractionToken = channel.discord.interactionToken;
   channel.state.hitlPrompts = {
     ...channel.state.hitlPrompts,
     [request.interactionId]: {
       content,
       messageId: posted.id,
+      ephemeralWebhookId,
       options: (request.request.options ?? []).map(({ id, label }) => ({ id, label })),
     },
   };
@@ -250,7 +286,12 @@ async function editDiscordSettledRequest(
   channel.state.hitlPrompts = rest;
   const label = resolvedPromptLabel(settlement, prompt.options);
   try {
-    await editDiscordResolvedPrompt(channel.discord, prompt, label);
+    await editDiscordResolvedPrompt(
+      channel.discord,
+      prompt,
+      label,
+      channel.state.promptInteractionToken,
+    );
   } catch (error) {
     log.warn("Discord answered prompt edit failed", { error, requestId: settlement.interactionId });
     await channel.discord.post("This request has ended, but its message could not be updated.");

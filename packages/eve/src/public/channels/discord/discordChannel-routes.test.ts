@@ -40,7 +40,7 @@ const components = [
 ];
 
 /** A press of Approve in guild G01, as Discord sends it: the presser on `member`. */
-function press(content: string | null = "Approve?"): Request {
+function press(content: string | null = "Approve?", webhookId?: string, flags = 64): Request {
   const body = JSON.stringify({
     application_id: "APP1",
     channel_id: "C01",
@@ -48,7 +48,13 @@ function press(content: string | null = "Approve?"): Request {
     guild_id: "G01",
     id: "I-U01",
     member: { user: { id: "U01", username: "U01" } },
-    message: { components, content, id: "M01" },
+    message: {
+      components,
+      content,
+      id: "M01",
+      webhook_id: webhookId,
+      flags: webhookId ? flags : undefined,
+    },
     token: "tok2",
     type: 3,
     version: 1,
@@ -90,8 +96,7 @@ async function firePost(
   return { response, finished: Promise.all(pending) };
 }
 
-describe("discordChannel press no session takes", () => {
-  const notActive = () => vi.fn().mockRejectedValue(new SessionNotActiveError());
+describe("discordChannel answer feedback", () => {
   const discordApi = (config: Parameters<typeof discordChannel>[0] = {}) => {
     const fetchMock = vi.fn(async (_url: unknown, _init?: RequestInit) =>
       Response.json({ channel_id: "C01", id: "M02" }),
@@ -110,69 +115,56 @@ describe("discordChannel press no session takes", () => {
         })),
     };
   };
-  const prompt = {
+  const busy = {
     body: {
       allowed_mentions: { parse: [] },
-      components: [],
-      content: "Approve?\n\nNo longer active",
+      components: [
+        {
+          type: 1,
+          components: [
+            { type: 2, custom_id: customId, disabled: true, label: "Approving…", style: 2 },
+          ],
+        },
+      ],
     },
     method: "PATCH",
     url: "https://discord.com/api/v10/channels/C01/messages/M01",
   };
-  const notice = {
-    body: { allowed_mentions: { parse: [] }, content: INACTIVE_REQUEST_NOTICE, flags: 64 },
-    method: "POST",
-    url: "https://discord.com/api/v10/webhooks/APP1/tok2",
-  };
-  const busy = {
-    body: {
-      type: 7,
-      data: {
-        allowed_mentions: { parse: [] },
-        components: [
-          {
-            type: 1,
-            components: [
-              { type: 2, custom_id: customId, disabled: true, label: "Approving…", style: 2 },
-            ],
-          },
-        ],
-      },
-    },
-    method: "POST",
-    url: "https://discord.com/api/v10/interactions/I-U01/tok2/callback",
-  };
-  const restored = {
-    body: { allowed_mentions: { parse: [] }, components },
+  const feedback = (content: string) => ({
+    body: { allowed_mentions: { parse: [] }, content },
     method: "PATCH",
     url: "https://discord.com/api/v10/webhooks/APP1/tok2/messages/@original",
-  };
+  });
+  const uncertainty = "I could not confirm your answer. It may already have been accepted.";
+  const rejected = "Your answer could not be accepted. Please try again.";
+  const received = feedback("Answer received.");
+  const clear = { ...busy, body: { allowed_mentions: { parse: [] }, components: [] } };
 
-  it("waits for authorization before changing shared controls", async () => {
+  it("keeps Discord's private loading response while authorization is pending", async () => {
     const answer = Promise.withResolvers<null>();
     const onAnswers = vi.fn(() => answer.promise);
     const { channel, calls } = discordApi({ onAnswers });
     const send = vi.fn();
     const request = press();
 
-    const posting = firePost(channel, request, send);
-    await vi.waitFor(() => {
-      expect(onAnswers).toHaveBeenCalledOnce();
-    });
+    const posted = await firePost(channel, request, send);
+    const acknowledgement = await posted.response.json();
     const pendingCalls = calls();
+    expect(acknowledgement).toEqual({ type: 5, data: { flags: 64 } });
     expect(pendingCalls).toEqual([]);
+    expect(onAnswers).toHaveBeenCalledOnce();
     expect(send).not.toHaveBeenCalled();
 
     answer.resolve(null);
-    const posted = await posting;
     await posted.finished;
-    const finishedCalls = calls();
-    expect(finishedCalls).toEqual([]);
+    const requests = calls();
+    const dropped = feedback("This answer was not accepted.");
+    expect(requests).toEqual([dropped]);
   });
 
   it("does not dispatch an answer before Discord commits the busy update", async () => {
-    const acknowledgement = Promise.withResolvers<Response>();
-    const fetchMock = vi.fn(() => acknowledgement.promise);
+    const edit = Promise.withResolvers<Response>();
+    const fetchMock = vi.fn(() => edit.promise);
     const { channel } = discordApi({ api: { fetch: fetchMock as typeof fetch } });
     const send = vi.fn();
     const delivery = {
@@ -184,89 +176,78 @@ describe("discordChannel press no session takes", () => {
     send.mockResolvedValue(delivery);
     const request = press();
 
-    const posting = firePost(channel, request, send);
+    const posted = await firePost(channel, request, send);
     await vi.waitFor(() => {
       expect(fetchMock).toHaveBeenCalledOnce();
     });
     expect(send).not.toHaveBeenCalled();
 
-    const response = new Response(null, { status: 204 });
-    acknowledgement.resolve(response);
-    const posted = await posting;
+    const response = Response.json({ id: "M01" });
+    edit.resolve(response);
     await posted.finished;
     expect(send).toHaveBeenCalledOnce();
   });
 
-  it("retires the pressed prompt and tells only the presser", async () => {
-    captureLogRecords();
-    const { channel, calls } = discordApi();
-    const request = press();
-    const send = notActive();
-
-    const posted = await firePost(channel, request, send);
-    await posted.finished;
-
-    const requests = calls();
-    expect(requests).toEqual([busy, prompt, notice]);
-  });
-
-  it("clears the busy controls when the press carries no prompt to keep", async () => {
-    captureLogRecords();
-    const { channel, calls } = discordApi();
-    const request = press(null);
-    const send = notActive();
-
-    const posted = await firePost(channel, request, send);
-    await posted.finished;
-
-    const requests = calls();
-    expect(requests).toEqual([
-      busy,
-      { ...restored, body: { allowed_mentions: { parse: [] }, components: [] } },
-      notice,
-    ]);
-  });
-
-  it("restores the controls and reports a delivery failure privately", async () => {
+  it("retires the pressed prompt and completes the private loading response", async () => {
     captureLogRecords();
     const { channel, calls } = discordApi();
     const request = press();
     const send = vi.fn();
-    const error = new Error("boom");
+    const error = new SessionNotActiveError();
     send.mockRejectedValue(error);
 
     const posted = await firePost(channel, request, send);
     await posted.finished;
 
     const requests = calls();
+    const inactive = feedback(INACTIVE_REQUEST_NOTICE);
     expect(requests).toEqual([
       busy,
-      restored,
       {
-        ...notice,
+        ...busy,
         body: {
           allowed_mentions: { parse: [] },
-          content: "Your answer could not be accepted. Please try again.",
-          flags: 64,
+          components: [],
+          content: "Approve?\n\nNo longer active",
         },
       },
+      inactive,
     ]);
   });
 
-  it("leaves the prompt alone when onAnswers drops the press", async () => {
-    const { channel, calls } = discordApi({ onAnswers: () => null });
-    const request = press();
+  it("clears the busy controls when the press carries no prompt to keep", async () => {
+    captureLogRecords();
+    const { channel, calls } = discordApi();
+    const request = press(null);
     const send = vi.fn();
+    const error = new SessionNotActiveError();
+    send.mockRejectedValue(error);
 
     const posted = await firePost(channel, request, send);
     await posted.finished;
 
     const requests = calls();
-    expect(requests).toEqual([]);
-    expect(send).not.toHaveBeenCalled();
+    const inactive = feedback(INACTIVE_REQUEST_NOTICE);
+    expect(requests).toEqual([busy, clear, inactive]);
   });
 
-  it("reports an authorization failure without changing the shared controls", async () => {
+  it("reports an admission error without restoring possibly settled controls", async () => {
+    captureLogRecords();
+    const { channel, calls } = discordApi();
+    const request = press();
+    const send = vi.fn();
+    const error = new Error("Delivery connection disconnected");
+    send.mockRejectedValue(error);
+
+    const posted = await firePost(channel, request, send);
+    await posted.finished;
+
+    const requests = calls();
+    const failed = feedback(uncertainty);
+    expect(requests).toEqual([busy, failed]);
+  });
+
+  it("reports an authorization failure without editing shared controls", async () => {
     captureLogRecords();
     const { channel, calls } = discordApi({
       onAnswers: () => {
@@ -278,11 +259,10 @@ describe("discordChannel press no session takes", () => {
 
     const posted = await firePost(channel, request, send);
     await posted.finished;
-    const acknowledgement = await posted.response.json();
-    const requests = calls();
 
-    expect(requests).toEqual([]);
-    expect(acknowledgement).toMatchObject({ data: { flags: 64 }, type: 4 });
+    const requests = calls();
+    const failed = feedback(rejected);
+    expect(requests).toEqual([failed]);
     expect(send).not.toHaveBeenCalled();
   });
 
@@ -301,20 +281,26 @@ describe("discordChannel press no session takes", () => {
     const request = press();
 
     const posted = await firePost(channel, request, send);
+    await vi.waitFor(() => {
+      const requests = calls();
+      expect(requests).toHaveLength(2);
+    });
     const pendingCalls = calls();
-    expect(pendingCalls).toEqual([busy]);
-    expect(posted.response.status).toBe(202);
+    expect(pendingCalls).toEqual([busy, received]);
 
     settled.resolve();
     await posted.finished;
     const finishedCalls = calls();
-    expect(finishedCalls).toEqual([busy]);
+    expect(finishedCalls).toEqual([busy, received]);
   });
 
   it("does not deliver an answer if the busy update fails", async () => {
     captureLogRecords();
-    const failure = new Response(null, { status: 500 });
-    const fetchMock = vi.fn(async () => failure);
+    const fetchMock = vi.fn(async (url: unknown) => {
+      const address = String(url);
+      if (address.includes("/channels/")) return new Response(null, { status: 500 });
+      return Response.json({ id: "M02" });
+    });
     const { channel } = discordApi({ api: { fetch: fetchMock as typeof fetch } });
     const request = press();
     const send = vi.fn();
@@ -322,8 +308,72 @@ describe("discordChannel press no session takes", () => {
     const posted = await firePost(channel, request, send);
     await posted.finished;
 
-    expect(posted.response.status).toBe(502);
     expect(send).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("edits an ephemeral source through its webhook using the fresh answer token", async () => {
+    const delivery = {
+      deliveryId: "D01",
+      async *stream() {
+        yield { type: "delivery.settled", data: { deliveryId: "D01", outcome: "applied" } };
+      },
+    };
+    const { channel, calls } = discordApi();
+    const send = vi.fn();
+    send.mockResolvedValue(delivery);
+    const request = press("Approve?", "APP1");
+
+    const posted = await firePost(channel, request, send);
+    await posted.finished;
+
+    const requests = calls();
+    expect(requests).toEqual([
+      { ...busy, url: "https://discord.com/api/v10/webhooks/APP1/tok2/messages/M01" },
+      received,
+    ]);
+    expect(send).toHaveBeenCalledOnce();
+  });
+
+  it("uses bot auth for public interaction prompts so token expiry cannot block edits", async () => {
+    const delivery = {
+      deliveryId: "D01",
+      async *stream() {
+        yield { type: "delivery.settled", data: { deliveryId: "D01", outcome: "applied" } };
+      },
+    };
+    const { channel, calls } = discordApi();
+    const send = vi.fn();
+    send.mockResolvedValue(delivery);
+    const request = press("Approve?", "APP1", 0);
+
+    const posted = await firePost(channel, request, send);
+    await posted.finished;
+
+    const requests = calls();
+    expect(requests).toEqual([busy, received]);
+  });
+
+  it("does not restore old controls when confirmation fails after admission", async () => {
+    captureLogRecords();
+    const delivery = {
+      deliveryId: "D01",
+      async *stream() {
+        yield { type: "response.submitted", data: { deliveryId: "D01", responseId: "R01" } };
+        throw new Error("Confirmation stream disconnected");
+      },
+    };
+    const { channel, calls } = discordApi();
+    const send = vi.fn();
+    send.mockResolvedValue(delivery);
+    const request = press();
+
+    const posted = await firePost(channel, request, send);
+    await posted.finished;
+
+    const requests = calls();
+    const failed = feedback(uncertainty);
+    expect(requests).toEqual([busy, received, failed]);
   });
 
   for (const outcome of ["refused", "failed"]) {
@@ -344,8 +394,8 @@ describe("discordChannel press no session takes", () => {
       await posted.finished;
 
       const requests = calls();
-      expect(requests).toHaveLength(2);
-      expect(requests[1]).toMatchObject({ body: { flags: 64 } });
+      const failed = feedback(rejected);
+      expect(requests).toEqual([busy, received, failed]);
     });
   }
 
@@ -365,9 +415,6 @@ describe("discordChannel press no session takes", () => {
     await posted.finished;
 
     const requests = calls();
-    expect(requests).toEqual([
-      busy,
-      { ...restored, body: { allowed_mentions: { parse: [] }, components: [] } },
-    ]);
+    expect(requests).toEqual([busy, received, clear]);
   });
 });

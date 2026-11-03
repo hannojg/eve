@@ -1,6 +1,10 @@
 import { generateKeyPairSync, sign, type KeyObject } from "node:crypto";
 
-import { discordContinuationToken, discordChannel } from "#public/channels/discord/index.js";
+import {
+  defaultDiscordAuth,
+  discordContinuationToken,
+  discordChannel,
+} from "#public/channels/discord/index.js";
 import {
   type ChannelDriver,
   type Person,
@@ -69,6 +73,7 @@ const RELAY_AUTH = {
 export function discordDriver(
   surface: Exclude<Surface, "public"> = "shared",
   transport: DiscordTransport = "interactions",
+  ephemeral = false,
 ): ChannelDriver {
   const dm = surface === "private";
   const gateway = transport !== "interactions";
@@ -89,7 +94,7 @@ export function discordDriver(
   const originals = new Map<string, string>();
   /** Interaction tokens answered with an ephemeral deferred response, which only the presser sees. */
   const ephemeralTokens = new Set<string>();
-  /** The platform keeps omitted fields when a callback or PATCH edits a message. */
+  /** The platform keeps omitted fields when a PATCH edits a message. */
   const messages = new Map<string, Record<string, unknown>>();
   /** The thread the bot started for the conversation, once it has. */
   let threadId: string | undefined;
@@ -139,26 +144,28 @@ export function discordDriver(
       return { body, method, response: { id: threadId, type: 11 } };
     }
     if (path.includes("/thread-members/")) return { body, method, response: {} };
-    const callback = /\/interactions\/[^/]+\/([^/]+)\/callback$/u.exec(path);
-    if (callback !== null && body.type === 7) {
-      const id = originals.get(callback[1]!);
-      if (id === undefined) throw new Error("Component callback has no original message.");
-      const previous = messages.get(id);
-      const response = { ...previous, ...body.data, channel_id: conversationChannel(), id };
-      messages.set(id, response);
-      return { body, method, response };
-    }
     const id = writtenMessageId(request.method, path);
     if (request.method === "POST" && /\/channels\/[^/]+\/messages$/u.test(path)) {
       lastBotMessage = id;
     }
     const previous = messages.get(id);
-    const response = {
+    const response: Record<string, unknown> = {
       ...previous,
       ...body,
       channel_id: /\/channels\/([^/]+)\//u.exec(path)?.[1] ?? channelId,
       id,
     };
+    const webhook = /^\/api\/v\d+\/webhooks\/([^/]+)\/([^/]+)/u.exec(path);
+    if (webhook !== null) {
+      response.webhook_id = webhook[1];
+      if (
+        previous === undefined &&
+        path.endsWith("/@original") &&
+        ephemeralTokens.has(webhook[2]!)
+      ) {
+        response.flags = EPHEMERAL_FLAG;
+      }
+    }
     messages.set(id, response);
     return { body, method, response };
   }
@@ -247,6 +254,13 @@ export function discordDriver(
     surface,
     createChannel: (record) =>
       discordChannel({
+        ...(ephemeral && {
+          onCommand: (_ctx, interaction) => ({
+            auth: defaultDiscordAuth(interaction),
+            ephemeral: true,
+          }),
+          onAnswers: (ctx) => ({ auth: ctx.defaultAuth }),
+        }),
         api: { fetch: recordingFetch(record, decode) },
         credentials: { applicationId: "APP1", botToken: "bot-token", publicKey: publicKeyHex },
         ...(gateway && { gateway: { auth: () => RELAY_AUTH, startThread: threads } }),
@@ -259,6 +273,7 @@ export function discordDriver(
     message: (text, person, files = []) => {
       if (gateway) return gatewayMessage(text, person, files);
       const id = nextInteraction();
+      if (ephemeral) ephemeralTokens.add(`tok-${id}`);
       // Each file rides an attachment option (type 11) whose value names it in `resolved`.
       const attached = files.map((file, index) => {
         const attachmentId = `A_${id}_${index}`;
@@ -351,13 +366,7 @@ export function discordDriver(
     press(option, person: Person) {
       const handle = option.handle as PressHandle;
       const id = nextInteraction();
-      if (handle.customId.startsWith("eve_auth:")) {
-        // eve answers a sign-in press with an ephemeral deferred response, a new message.
-        ephemeralTokens.add(`tok-${id}`);
-      } else {
-        // A component interaction's `@original` response is the message holding the component.
-        originals.set(`tok-${id}`, handle.messageId);
-      }
+      ephemeralTokens.add(`tok-${id}`);
       return signed(
         JSON.stringify({
           application_id: "APP1",
@@ -426,8 +435,6 @@ function visibleChoices(
  * channel message when the interaction token fails.
  */
 function isMessageWrite(call: PlatformCall): boolean {
-  if (call.method.endsWith("/callback"))
-    return (call.body as { readonly type?: number }).type === 7;
   return (
     /^(PATCH|POST) /u.test(call.method) &&
     !call.method.endsWith("/typing") &&
