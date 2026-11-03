@@ -1,5 +1,14 @@
 # eve
 
+## 1.0.0-rc.3
+
+Released 2026-11-03 · [Compare with 1.0.0-rc.2](https://github.com/vercel/eve/compare/eve%401.0.0-rc.2...eve%401.0.0-rc.3)
+
+### Bug Fixes
+
+- Fix durable agent traces keeping every finished turn that called tools in parallel: each one stayed in the session's serialized context, so step inputs grew with every turn.
+  A checkpoint this process had already written, read back through another execution context, was treated as another process's write and forked the turn's trace tree; the stale copy then overwrote the tool completions and the checkpoint was never deleted. A replaced tree now also stops persisting. ([#5835](https://github.com/vercel/eve/pull/5835))
+
 ## 1.0.0-rc.2
 
 Released 2026-11-02 · [Compare with 1.0.0-rc.1](https://github.com/vercel/eve/compare/eve%401.0.0-rc.1...eve%401.0.0-rc.2)
